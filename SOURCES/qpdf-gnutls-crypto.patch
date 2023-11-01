@@ -1,0 +1,1142 @@
+diff --git a/configure.ac b/configure.ac
+index a9f0316..6ff59ef 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -348,6 +348,36 @@ AC_ARG_ENABLE(show-failed-test-output,
+     fi],
+    [SHOW_FAILED_TEST_OUTPUT=0])
+ 
++AC_PATH_TOOL(PKGCONFIG, pkg-config)
++
++AC_MSG_CHECKING(if cryptography will be supplied by GNU TLS)
++AC_ARG_ENABLE(gnutls,
++   AS_HELP_STRING([--enable-gnutls],
++                  [enable cryptography by GNUTLS]),
++   [if test "$enableval" = "yes"; then
++      if test "x$PKGCONFIG" != x ; then
++        AC_TRY_COMPILE([
++        #include <gnutls/crypto.h>], , , AC_MSG_ERROR([GNU TLS development headers are needed.]))
++        GNUTLSFLAGS=`pkg-config --cflags gnutls`
++        GNUTLSLIBS=`pkg-config --libs gnutls`
++        LIBS="$LIBS $GNUTLSLIBS"
++        CPPFLAGS="$CPPFLAGS $GNUTLSFLAGS"
++        AC_DEFINE([HAVE_GNUTLS], [1], [If cryptography will be supplied by GNU TLS])
++        HAVE_GNUTLS=1
++      else
++        HAVE_GNUTLS=0
++        AC_MSG_ERROR([pkg-config is needed to configure compilation with GNU TLS.])
++      fi
++    else
++      HAVE_GNUTLS=0
++    fi],
++   [HAVE_GNUTLS=0])
++if test "$HAVE_GNUTLS" = "1" ; then
++   AC_MSG_RESULT(yes)
++else
++   AC_MSG_RESULT(no)
++fi
++
+ AC_ARG_WITH(docbook-xsl,
+    AS_HELP_STRING([--with-docbook-xsl=DIR],
+ 		  [location of docbook 4.x xml stylesheets]),
+diff --git a/libqpdf/MD5-gnutls.cc b/libqpdf/MD5-gnutls.cc
+new file mode 100644
+index 0000000..5611b3e
+--- /dev/null
++++ b/libqpdf/MD5-gnutls.cc
+@@ -0,0 +1,61 @@
++#include <gnutls/crypto.h>
++#include <qpdf/MD5.hh>
++#include <qpdf/QUtil.hh>
++
++
++// MD5 initialization. Begins an MD5 operation, writing a new context.
++void MD5::init()
++{
++    int ret;
++
++    ret = gnutls_hash_init(&ctx, GNUTLS_DIG_MD5);
++    if (ret < 0) {
++	QUtil::throw_system_error(
++	    std::string("GNU TLS: MD5 error:") + std::string(gnutls_strerror(ret)));
++	ctx = nullptr;
++    }
++
++    finalized = false;
++    memset(digest_val, 0, sizeof(digest_val));
++}
++
++// MD5 block update operation. Continues an MD5 message-digest
++// operation, processing another message block, and updating the
++// context.
++
++void MD5::update(unsigned char *input,
++		 unsigned int inputLen)
++{
++    if (ctx != nullptr && input != nullptr)
++	gnutls_hash(ctx, input, inputLen);
++}
++
++// MD5 finalization. Ends an MD5 message-digest operation, writing the
++// the message digest and zeroizing the context.
++void MD5::final()
++{
++    if (finalized)
++	return;
++
++    if (ctx != nullptr)
++    {
++	gnutls_hash_deinit(ctx, digest_val);
++	ctx = nullptr;
++    }
++
++    finalized = true;
++}
++
++// MD5 basic transformation. Transforms state based on block.
++void MD5::transform(UINT4 state[4], unsigned char block[64])
++{}
++
++// Encodes input (UINT4) into output (unsigned char). Assumes len is a
++// multiple of 4.
++void MD5::encode(unsigned char *output, UINT4 *input, unsigned int len)
++{}
++
++// Decodes input (unsigned char) into output (UINT4). Assumes len is a
++// multiple of 4.
++void MD5::decode(UINT4 *output, unsigned char *input, unsigned int len)
++{}
+diff --git a/libqpdf/MD5.cc b/libqpdf/MD5.cc
+index 0504e2d..19dce79 100644
+--- a/libqpdf/MD5.cc
++++ b/libqpdf/MD5.cc
+@@ -36,6 +36,10 @@
+ #include <string.h>
+ #include <errno.h>
+ 
++#ifdef HAVE_GNUTLS
++# include "MD5-gnutls.cc"
++#else
++
+ int const S11 = 7;
+ int const S12 = 12;
+ int const S13 = 17;
+@@ -294,6 +298,8 @@ void MD5::decode(UINT4 *output, unsigned char *input, unsigned int len)
+             (static_cast<UINT4>(input[j+3]) << 24);
+ }
+ 
++#endif /* HAVE_GNUTLS */
++
+ // Public functions
+ 
+ MD5::MD5()
+diff --git a/libqpdf/Pl_AES_PDF-gnutls.cc b/libqpdf/Pl_AES_PDF-gnutls.cc
+new file mode 100644
+index 0000000..7704e6d
+--- /dev/null
++++ b/libqpdf/Pl_AES_PDF-gnutls.cc
+@@ -0,0 +1,246 @@
++#include <qpdf/Pl_AES_PDF.hh>
++#include <gnutls/crypto.h>
++#include <qpdf/rijndael-gnutls.h>
++
++bool Pl_AES_PDF::use_static_iv = false;
++
++Pl_AES_PDF::Pl_AES_PDF(char const* identifier, Pipeline* next,
++		       bool encrypt, unsigned char const* key,
++                       unsigned int key_bytes) :
++    Pipeline(identifier, next),
++    encrypt(encrypt),
++    cbc_mode(true),
++    first(true),
++    offset(0),
++    nrounds(0),
++    use_zero_iv(false),
++    use_specified_iv(false),
++    disable_padding(false)
++{
++    unsigned int keybits = 8 * key_bytes;
++    this->keylen = key_bytes;
++    this->ctx = nullptr;
++    assert(key_bytes == KEYLENGTH(keybits));
++    this->key = new unsigned char[key_bytes];
++    this->rk = new uint32_t[RKLENGTH(keybits)];
++    unsigned int rk_bytes = RKLENGTH(keybits) * sizeof(uint32_t);
++    std::memcpy(this->key, key, key_bytes);
++    std::memset(this->rk, 0, rk_bytes);
++    std::memset(this->inbuf, 0, this->buf_size);
++    std::memset(this->outbuf, 0, this->buf_size);
++    std::memset(this->cbc_block, 0, this->buf_size);
++}
++
++Pl_AES_PDF::~Pl_AES_PDF()
++{
++    delete [] this->key;
++    delete [] this->rk;
++}
++
++void
++Pl_AES_PDF::useZeroIV()
++{
++    this->use_zero_iv = true;
++}
++
++void
++Pl_AES_PDF::disablePadding()
++{
++    this->disable_padding = true;
++}
++
++void
++Pl_AES_PDF::setIV(unsigned char const* iv, size_t bytes)
++{
++    if (bytes != this->buf_size)
++    {
++        throw std::logic_error(
++            "Pl_AES_PDF: specified initialization vector"
++            " size in bytes must be " + QUtil::int_to_string(bytes));
++    }
++    this->use_specified_iv = true;
++    memcpy(this->specified_iv, iv, bytes);
++}
++
++void
++Pl_AES_PDF::disableCBC()
++{
++    this->cbc_mode = false;
++}
++
++void
++Pl_AES_PDF::useStaticIV()
++{
++    use_static_iv = true;
++}
++
++void
++Pl_AES_PDF::write(unsigned char* data, size_t len)
++{
++    size_t bytes_left = len;
++    unsigned char* p = data;
++
++    while (bytes_left > 0)
++    {
++	if (this->offset == this->buf_size)
++	{
++	    flush(false);
++	}
++
++	size_t available = this->buf_size - this->offset;
++	size_t bytes = (bytes_left < available ? bytes_left : available);
++	bytes_left -= bytes;
++	std::memcpy(this->inbuf + this->offset, p, bytes);
++	this->offset += bytes;
++	p += bytes;
++    }
++}
++
++void
++Pl_AES_PDF::finish()
++{
++    if (this->encrypt)
++    {
++	if (this->offset == this->buf_size)
++	{
++	    flush(false);
++	}
++        if (! this->disable_padding)
++        {
++            // Pad as described in section 3.5.1 of version 1.7 of the PDF
++            // specification, including providing an entire block of padding
++            // if the input was a multiple of 16 bytes.
++            unsigned char pad =
++                static_cast<unsigned char>(this->buf_size - this->offset);
++            memset(this->inbuf + this->offset, pad, pad);
++            this->offset = this->buf_size;
++            flush(false);
++        }
++    }
++    else
++    {
++	if (this->offset != this->buf_size)
++	{
++	    // This is never supposed to happen as the output is
++	    // always supposed to be padded.  However, we have
++	    // encountered files for which the output is not a
++	    // multiple of the block size.  In this case, pad with
++	    // zeroes and hope for the best.
++	    assert(this->buf_size > this->offset);
++	    std::memset(this->inbuf + this->offset, 0,
++			this->buf_size - this->offset);
++	    this->offset = this->buf_size;
++	}
++	flush(! this->disable_padding);
++    }
++
++    if (this->cbc_mode)
++	rijndaelFinish(this->ctx);
++
++    getNext()->finish();
++}
++
++void
++Pl_AES_PDF::initializeVector()
++{
++    if (use_zero_iv)
++    {
++	for (unsigned int i = 0; i < this->buf_size; ++i)
++	{
++	    this->cbc_block[i] = 0;
++	}
++    }
++    else if (use_specified_iv)
++    {
++        std::memcpy(this->cbc_block, this->specified_iv, this->buf_size);
++    }
++    else if (use_static_iv)
++    {
++	for (unsigned int i = 0; i < this->buf_size; ++i)
++	{
++	    this->cbc_block[i] = 14 * (1 + i);
++	}
++    }
++    else
++    {
++        QUtil::initializeWithRandomBytes(this->cbc_block, this->buf_size);
++    }
++}
++
++void
++Pl_AES_PDF::flush(bool strip_padding)
++{
++    assert(this->offset == this->buf_size);
++
++    if (first)
++    {
++	first = false;
++	if (this->cbc_mode)
++	{
++	    if (encrypt)
++	    {
++		// Set cbc_block to the initialization vector, and if
++		// not zero, write it to the output stream.
++		initializeVector();
++                if (! (this->use_zero_iv || this->use_specified_iv))
++                {
++                    getNext()->write(this->cbc_block, this->buf_size);
++                }
++	    }
++	    else if (this->use_zero_iv || this->use_specified_iv)
++            {
++                // Initialize vector with zeroes; zero vector was not
++                // written to the beginning of the input file.
++                initializeVector();
++            }
++            else
++	    {
++		// Take the first block of input as the initialization
++		// vector.  There's nothing to write at this time.
++		memcpy(this->cbc_block, this->inbuf, this->buf_size);
++		this->offset = 0;
++		rijndaelInit(&(this->ctx), this->key, this->keylen, this->cbc_block, this->buf_size);
++		return;
++	    }
++	    rijndaelInit(&(this->ctx), this->key, this->keylen, this->cbc_block, this->buf_size);
++	}
++    }
++
++    if (this->encrypt)
++    {
++	if (this->cbc_mode)
++	    rijndaelCBCEncrypt(this->ctx, this->inbuf, this->outbuf, this->buf_size);
++	else
++	    rijndaelECBEncrypt(this->key, this->keylen, this->cbc_block, this->inbuf, this->outbuf, this->buf_size);
++    }
++    else
++    {
++	if (this->cbc_mode)
++	    rijndaelCBCDecrypt(this->ctx, this->inbuf, this->outbuf, this->buf_size);
++	else
++	    rijndaelECBDecrypt(this->key, this->keylen, this->cbc_block, this->inbuf, this->outbuf, this->buf_size);
++    }
++    unsigned int bytes = this->buf_size;
++    if (strip_padding)
++    {
++	unsigned char last = this->outbuf[this->buf_size - 1];
++	if (last <= this->buf_size)
++	{
++	    bool strip = true;
++	    for (unsigned int i = 1; i <= last; ++i)
++	    {
++		if (this->outbuf[this->buf_size - i] != last)
++		{
++		    strip = false;
++		    break;
++		}
++	    }
++	    if (strip)
++	    {
++		bytes -= last;
++	    }
++	}
++    }
++    getNext()->write(this->outbuf, bytes);
++    this->offset = 0;
++}
+diff --git a/libqpdf/Pl_AES_PDF.cc b/libqpdf/Pl_AES_PDF.cc
+index 5c493cb..ac8bde4 100644
+--- a/libqpdf/Pl_AES_PDF.cc
++++ b/libqpdf/Pl_AES_PDF.cc
+@@ -3,10 +3,15 @@
+ #include <cstring>
+ #include <assert.h>
+ #include <stdexcept>
+-#include <qpdf/rijndael.h>
++
+ #include <string>
+ #include <stdlib.h>
+ 
++#ifdef HAVE_GNUTLS
++# include "Pl_AES_PDF-gnutls.cc"
++#else
++# include <qpdf/rijndael.h>
++
+ bool Pl_AES_PDF::use_static_iv = false;
+ 
+ Pl_AES_PDF::Pl_AES_PDF(char const* identifier, Pipeline* next,
+@@ -263,3 +268,4 @@ Pl_AES_PDF::flush(bool strip_padding)
+     getNext()->write(this->outbuf, bytes);
+     this->offset = 0;
+ }
++#endif
+diff --git a/libqpdf/Pl_SHA2.cc b/libqpdf/Pl_SHA2.cc
+index 17eff7e..9156451 100644
+--- a/libqpdf/Pl_SHA2.cc
++++ b/libqpdf/Pl_SHA2.cc
+@@ -13,6 +13,12 @@ Pl_SHA2::Pl_SHA2(int bits, Pipeline* next) :
+     {
+         resetBits(bits);
+     }
++
++#ifdef HAVE_GNUTLS
++    this->ctx256 = nullptr;
++    this->ctx384 = nullptr;
++    this->ctx512 = nullptr;
++#endif
+ }
+ 
+ Pl_SHA2::~Pl_SHA2()
+diff --git a/libqpdf/RC4-gnutls.cc b/libqpdf/RC4-gnutls.cc
+new file mode 100644
+index 0000000..093a5b9
+--- /dev/null
++++ b/libqpdf/RC4-gnutls.cc
+@@ -0,0 +1,51 @@
++#include <qpdf/RC4.hh>
++#include <qpdf/QUtil.hh>
++#include <gnutls/crypto.h>
++
++
++RC4::RC4(unsigned char const* key_data, int key_len)
++{
++    if (key_len == -1)
++    {
++	key_len = strlen(reinterpret_cast<char const*>(key_data));
++    }
++
++    int ret;
++    gnutls_cipher_algorithm_t alg = GNUTLS_CIPHER_ARCFOUR_128;
++
++    this->key.data = const_cast<unsigned char*>(key_data);
++    this->key.size = key_len;
++
++    ret = gnutls_cipher_init(&(this->ctx),
++                             alg,
++                             &(this->key),
++                             NULL);
++    if (ret < 0)
++    {
++	QUtil::throw_system_error(
++	    std::string("GNU TLS: RC4 error: ") + std::string(gnutls_strerror(ret)));
++	this->ctx = nullptr;
++    }
++}
++
++RC4::~RC4()
++{
++    if (this->ctx != nullptr)
++    {
++	gnutls_cipher_deinit(this->ctx);
++	this->ctx = nullptr;
++    }
++}
++
++void
++RC4::process(unsigned char *in_data, int len, unsigned char* out_data)
++{
++    if (out_data == 0)
++    {
++	// Convert in place
++	out_data = in_data;
++    }
++
++    if (this->ctx != nullptr && in_data != nullptr)
++	gnutls_cipher_encrypt2(this->ctx, in_data, len, out_data, len);
++}
+diff --git a/libqpdf/RC4.cc b/libqpdf/RC4.cc
+index 7639a36..c1288be 100644
+--- a/libqpdf/RC4.cc
++++ b/libqpdf/RC4.cc
+@@ -2,6 +2,10 @@
+ 
+ #include <string.h>
+ 
++#ifdef HAVE_GNUTLS
++# include "RC4-gnutls.cc"
++#else
++
+ static void swap_byte(unsigned char &a, unsigned char &b)
+ {
+     unsigned char t;
+@@ -53,3 +57,4 @@ RC4::process(unsigned char *in_data, int len, unsigned char* out_data)
+ 	out_data[i] = in_data[i] ^ key.state[xor_index];
+     }
+ }
++#endif
+diff --git a/libqpdf/SecureRandomDataProvider.cc b/libqpdf/SecureRandomDataProvider.cc
+index fe9f1d4..d72269e 100644
+--- a/libqpdf/SecureRandomDataProvider.cc
++++ b/libqpdf/SecureRandomDataProvider.cc
+@@ -11,6 +11,10 @@
+ # endif
+ #endif
+ 
++#ifdef HAVE_GNUTLS
++# include <gnutls/crypto.h>
++#endif
++
+ SecureRandomDataProvider::SecureRandomDataProvider()
+ {
+ }
+@@ -89,7 +93,19 @@ class WindowsCryptProvider
+ void
+ SecureRandomDataProvider::provideRandomData(unsigned char* data, size_t len)
+ {
+-#if defined(_WIN32)
++#if defined(HAVE_GNUTLS)
++
++    int ret = 0;
++
++    ret = gnutls_rnd(GNUTLS_RND_NONCE, data, len);
++    if (ret < 0)
++    {
++        throw std::runtime_error(
++            "GNU TLS: unable to generate secure random data " +
++            std::string(gnutls_strerror(ret)));
++    }
++
++#elif defined(_WIN32)
+ 
+     // Optimization: make the WindowsCryptProvider static as long as
+     // it can be done in a thread-safe fashion.
+diff --git a/libqpdf/qpdf/MD5.hh b/libqpdf/qpdf/MD5.hh
+index 4cfe027..bb9f756 100644
+--- a/libqpdf/qpdf/MD5.hh
++++ b/libqpdf/qpdf/MD5.hh
+@@ -11,6 +11,10 @@
+ #endif
+ #include <string>
+ 
++#ifdef HAVE_GNUTLS
++# include <gnutls/crypto.h>
++#endif
++
+ class MD5
+ {
+   public:
+@@ -87,6 +91,9 @@ class MD5
+ 
+     bool finalized;
+     Digest digest_val;
++#ifdef HAVE_GNUTLS
++    gnutls_hash_hd_t ctx;
++#endif
+ };
+ 
+ #endif // __MD5_HH__
+diff --git a/libqpdf/qpdf/Pl_AES_PDF.hh b/libqpdf/qpdf/Pl_AES_PDF.hh
+index 9aa73ad..8059e7d 100644
+--- a/libqpdf/qpdf/Pl_AES_PDF.hh
++++ b/libqpdf/qpdf/Pl_AES_PDF.hh
+@@ -7,6 +7,10 @@
+ # include <stdint.h>
+ #endif
+ 
++#ifdef HAVE_GNUTLS
++# include <gnutls/crypto.h>
++#endif
++
+ // This pipeline implements AES-128 and AES-256 with CBC and block
+ // padding as specified in the PDF specification.
+ 
+@@ -64,6 +68,11 @@ class Pl_AES_PDF: public Pipeline
+     bool use_zero_iv;
+     bool use_specified_iv;
+     bool disable_padding;
++
++#ifdef HAVE_GNUTLS
++    gnutls_cipher_hd_t ctx;
++    unsigned int keylen;
++#endif
+ };
+ 
+ #endif // __PL_AES_PDF_HH__
+diff --git a/libqpdf/qpdf/RC4.hh b/libqpdf/qpdf/RC4.hh
+index c26f3d0..1421a08 100644
+--- a/libqpdf/qpdf/RC4.hh
++++ b/libqpdf/qpdf/RC4.hh
+@@ -1,6 +1,12 @@
+ #ifndef __RC4_HH__
+ #define __RC4_HH__
+ 
++#include <qpdf/qpdf-config.h>
++
++#ifdef HAVE_GNUTLS
++# include <gnutls/crypto.h>
++#endif
++
+ class RC4
+ {
+   public:
+@@ -10,7 +16,15 @@ class RC4
+     // out_data = 0 means to encrypt/decrypt in place
+     void process(unsigned char* in_data, int len, unsigned char* out_data = 0);
+ 
++#ifdef HAVE_GNUTLS
++    ~RC4();
++#endif
++
+   private:
++#ifdef HAVE_GNUTLS
++    gnutls_cipher_hd_t ctx;
++    gnutls_datum_t key;
++#else
+     class RC4Key
+     {
+       public:
+@@ -20,6 +34,7 @@ class RC4
+     };
+ 
+     RC4Key key;
++#endif
+ };
+ 
+ #endif // __RC4_HH__
+diff --git a/libqpdf/qpdf/rijndael-gnutls.h b/libqpdf/qpdf/rijndael-gnutls.h
+new file mode 100644
+index 0000000..a3e7ff0
+--- /dev/null
++++ b/libqpdf/qpdf/rijndael-gnutls.h
+@@ -0,0 +1,32 @@
++#ifdef HAVE_INTTYPES_H
++# include <inttypes.h>
++#endif
++#ifdef HAVE_STDINT_H
++# include <stdint.h>
++#endif
++
++#include <gnutls/crypto.h>
++
++void rijndaelInit(gnutls_cipher_hd_t * context, unsigned char * key,
++  unsigned int keylen, unsigned char cbc_block[16], unsigned int buf_size);
++int rijndaelSetupEncrypt(uint32_t *rk, const unsigned char *key,
++  int keybits);
++int rijndaelSetupDecrypt(uint32_t *rk, const unsigned char *key,
++  int keybits);
++void rijndaelCBCEncrypt(gnutls_cipher_hd_t context,
++  const unsigned char plaintext[16], unsigned char ciphertext[16],
++  unsigned int buf_size);
++void rijndaelCBCDecrypt(gnutls_cipher_hd_t context,
++  const unsigned char ciphertext[16], unsigned char plaintext[16],
++  unsigned int buf_size);
++void rijndaelECBEncrypt(unsigned char * key, unsigned int keylen,
++  unsigned char cbc_block[16], const unsigned char plaintext[16],
++  unsigned char ciphertext[16], unsigned int buf_size);
++void rijndaelECBDecrypt(unsigned char * key, unsigned int keylen,
++  unsigned char cbc_block[16], const unsigned char ciphertext[16],
++  unsigned char plaintext[16], unsigned int buf_size);
++void rijndaelFinish(gnutls_cipher_hd_t context);
++
++#define KEYLENGTH(keybits) ((keybits)/8)
++#define RKLENGTH(keybits)  ((keybits)/8+28)
++#define NROUNDS(keybits)   ((keybits)/32+6)
+diff --git a/libqpdf/qpdf/rijndael.h b/libqpdf/qpdf/rijndael.h
+index a9cd71d..9698a8b 100644
+--- a/libqpdf/qpdf/rijndael.h
++++ b/libqpdf/qpdf/rijndael.h
+@@ -9,6 +9,10 @@
+ # include <stdint.h>
+ #endif
+ 
++#ifdef HAVE_GNUTLS
++# include "qpdf/rijndael-gnutls.h"
++#else
++
+ int rijndaelSetupEncrypt(uint32_t *rk, const unsigned char *key,
+   int keybits);
+ int rijndaelSetupDecrypt(uint32_t *rk, const unsigned char *key,
+@@ -22,4 +26,6 @@ void rijndaelDecrypt(const uint32_t *rk, int nrounds,
+ #define RKLENGTH(keybits)  ((keybits)/8+28)
+ #define NROUNDS(keybits)   ((keybits)/32+6)
+ 
++#endif /* HAVE_GNUTLS */
++
+ #endif
+diff --git a/libqpdf/rijndael-gnutls.cc b/libqpdf/rijndael-gnutls.cc
+new file mode 100644
+index 0000000..dd3fdb2
+--- /dev/null
++++ b/libqpdf/rijndael-gnutls.cc
+@@ -0,0 +1,116 @@
++#include <cstring>
++#include <gnutls/crypto.h>
++#include <qpdf/QUtil.hh>
++#include <qpdf/rijndael-gnutls.h>
++
++typedef uint32_t u32;
++
++/**
++ * Init cryptographic context
++ */
++void rijndaelInit(gnutls_cipher_hd_t * ctx, unsigned char * key,
++  unsigned int keylen, unsigned char cbc_block[16],
++  unsigned int buf_size)
++{
++  int ret;
++  gnutls_cipher_algorithm_t alg;
++  gnutls_datum_t cipher_key;
++  gnutls_datum_t iv;
++
++  cipher_key.data = key;
++
++  switch(keylen) {
++    case 16:
++      alg = GNUTLS_CIPHER_AES_128_CBC;
++      break;
++    case 32:
++      alg = GNUTLS_CIPHER_AES_256_CBC;
++      break;
++    case 24:
++      alg = GNUTLS_CIPHER_AES_192_CBC;
++      break;
++    default:
++      alg = GNUTLS_CIPHER_AES_128_CBC;
++      break;
++  }
++
++  cipher_key.size = gnutls_cipher_get_key_size(alg);
++
++  iv.data = cbc_block;
++  iv.size = buf_size;
++
++  ret = gnutls_cipher_init(ctx, alg, &cipher_key, &iv);
++  if (ret < 0)
++  {
++    QUtil::throw_system_error(
++      std::string("GNU TLS: AES error: ") + std::string(gnutls_strerror(ret)));
++    ctx = NULL;
++    return;
++  }
++}
++
++/**
++ * Encrypt string by AES CBC by GNU TLS.
++ */
++void rijndaelCBCEncrypt(gnutls_cipher_hd_t ctx,
++  const unsigned char plaintext[16], unsigned char ciphertext[16],
++  unsigned int buf_size)
++{
++  if (ctx != nullptr)
++    gnutls_cipher_encrypt2(ctx, plaintext, buf_size, ciphertext, buf_size);
++}
++
++/**
++ * Decrypt string by AES CBC by GNU TLS.
++ */
++void rijndaelCBCDecrypt(gnutls_cipher_hd_t ctx,
++  const unsigned char ciphertext[16], unsigned char plaintext[16],
++  unsigned int buf_size)
++{
++  if (ctx != nullptr)
++    gnutls_cipher_decrypt2(ctx, ciphertext, buf_size, plaintext, buf_size);
++}
++
++/**
++ * Encrypt string by AES ECB by GNU TLS.
++ */
++void rijndaelECBEncrypt(unsigned char * key, unsigned int keylen,
++  unsigned char cbc_block[16], const unsigned char ciphertext[16],
++  unsigned char plaintext[16], unsigned int buf_size)
++{
++  gnutls_cipher_hd_t ctx;
++
++  rijndaelInit(&ctx, key, keylen, cbc_block, buf_size);
++
++  rijndaelCBCEncrypt(ctx, ciphertext, plaintext, buf_size);
++
++  rijndaelFinish(ctx);
++}
++
++/**
++ * Decrypt string by AES ECB by GNU TLS.
++ */
++void rijndaelECBDecrypt(unsigned char * key, unsigned int keylen,
++  unsigned char cbc_block[16], const unsigned char ciphertext[16],
++  unsigned char plaintext[16], unsigned int buf_size)
++{
++  gnutls_cipher_hd_t ctx;
++
++  rijndaelInit(&ctx, key, keylen, cbc_block, buf_size);
++
++  rijndaelCBCDecrypt(ctx, ciphertext, plaintext, buf_size);
++
++  rijndaelFinish(ctx);
++}
++
++/**
++ * Finish cryptography context
++ */
++void rijndaelFinish(gnutls_cipher_hd_t ctx)
++{
++  if (ctx != nullptr)
++  {
++    gnutls_cipher_deinit(ctx);
++    ctx = nullptr;
++  }
++}
+diff --git a/libqpdf/rijndael.cc b/libqpdf/rijndael.cc
+index 7f711df..117c1a1 100644
+--- a/libqpdf/rijndael.cc
++++ b/libqpdf/rijndael.cc
+@@ -2,6 +2,10 @@
+ 
+ #include "qpdf/rijndael.h"
+ 
++#ifdef HAVE_GNUTLS
++# include "rijndael-gnutls.cc"
++#else
++
+ typedef uint32_t u32;
+ typedef unsigned char u8;
+ 
+@@ -1206,3 +1210,4 @@ void rijndaelDecrypt(const u32 *rk, int nrounds, const u8 ciphertext[16],
+     rk[3];
+   PUTU32(plaintext + 12, s3);
+ }
++#endif
+diff --git a/libqpdf/sha2-gnutls.c b/libqpdf/sha2-gnutls.c
+new file mode 100644
+index 0000000..29155d5
+--- /dev/null
++++ b/libqpdf/sha2-gnutls.c
+@@ -0,0 +1,41 @@
++#include <gnutls/crypto.h>
++#include <stdio.h>
++#include "sph/sph_sha2_gnutls.h"
++
++
++/* see sph_sha2.h */
++void
++sph_sha256_init(void * cc)
++{
++	int ret;
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	ret = gnutls_hash_init(ctx, GNUTLS_DIG_SHA256);
++	if (ret < 0)
++	{
++		fprintf(stderr, "GNU TLS: SHA256 error : %s\n", gnutls_strerror(ret));
++		cc = NULL;
++	}
++}
++
++/* see sph_sha2.h */
++void
++sph_sha256_close(void * cc, void *dst)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL)
++	{
++		gnutls_hash_deinit(*(ctx), dst);
++		cc = NULL;
++	}
++}
++
++/* see sph_sha2.h */
++void sph_sha256(void * cc, const void * data, size_t len)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL && data != NULL)
++		gnutls_hash(*(ctx), data, len);
++}
+diff --git a/libqpdf/sha2.c b/libqpdf/sha2.c
+index 45fdd7e..e240f9b 100644
+--- a/libqpdf/sha2.c
++++ b/libqpdf/sha2.c
+@@ -35,6 +35,10 @@
+ 
+ #include "sph/sph_sha2.h"
+ 
++#ifdef HAVE_GNUTLS
++# include "sha2-gnutls.c"
++#else
++
+ #if SPH_SMALL_FOOTPRINT && !defined SPH_SMALL_FOOTPRINT_SHA2
+ #define SPH_SMALL_FOOTPRINT_SHA2   1
+ #endif
+@@ -688,3 +692,5 @@ sph_sha224_comp(const sph_u32 msg[16], sph_u32 val[8])
+ 	SHA2_ROUND_BODY(SHA2_IN, val);
+ #undef SHA2_IN
+ }
++
++#endif /* HAVE_GNUTLS */
+diff --git a/libqpdf/sha2big-gnutls.c b/libqpdf/sha2big-gnutls.c
+new file mode 100644
+index 0000000..494e2b4
+--- /dev/null
++++ b/libqpdf/sha2big-gnutls.c
+@@ -0,0 +1,80 @@
++#include <gnutls/crypto.h>
++#include <stdio.h>
++#include "sph/sph_sha2_gnutls.h"
++
++
++/* see sph_sha3.h */
++void
++sph_sha384_init(void * cc)
++{
++	int ret;
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	ret = gnutls_hash_init(ctx, GNUTLS_DIG_SHA384);
++	if (ret < 0)
++	{
++		fprintf(stderr, "GNU TLS: SHA384 error: %s\n", gnutls_strerror(ret));
++		cc = NULL;
++	}
++}
++
++/* see sph_sha3.h */
++void
++sph_sha384_close(void * cc, void *dst)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL && dst != NULL)
++	{
++		gnutls_hash_deinit(*(ctx), dst);
++		cc = NULL;
++	}
++}
++
++/* see sph_sha3.h */
++void
++sph_sha384(void * cc, const void * data, size_t len)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL && data != NULL)
++		gnutls_hash(*(ctx), data, len);
++}
++
++/* see sph_sha3.h */
++void
++sph_sha512_init(void * cc)
++{
++	int ret;
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	ret = gnutls_hash_init(ctx, GNUTLS_DIG_SHA512);
++	if (ret < 0)
++	{
++		fprintf(stderr, "GNU TLS: SHA512 error: %s\n", gnutls_strerror(ret));
++		cc = NULL;
++	}
++}
++
++/* see sph_sha3.h */
++void
++sph_sha512_close(void * cc, void * dst)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL && dst != NULL)
++	{
++		gnutls_hash_deinit(*(ctx), dst);
++		cc = NULL;
++	}
++}
++
++/* see sph_sha3.h */
++void
++sph_sha512(void * cc, const void * data, size_t len)
++{
++	gnutls_hash_hd_t * ctx = (gnutls_hash_hd_t*) cc;
++
++	if (ctx != NULL && data != NULL)
++		gnutls_hash(*(ctx), data, len);
++}
+diff --git a/libqpdf/sha2big.c b/libqpdf/sha2big.c
+index e4aadbd..3194a10 100644
+--- a/libqpdf/sha2big.c
++++ b/libqpdf/sha2big.c
+@@ -35,6 +35,10 @@
+ 
+ #include "sph/sph_sha2.h"
+ 
++#ifdef HAVE_GNUTLS
++# include "sha2big-gnutls.c"
++#else
++
+ #if SPH_64
+ 
+ #define CH(X, Y, Z)    ((((Y) ^ (Z)) & (X)) ^ (Z))
+@@ -245,3 +249,5 @@ sph_sha384_comp(const sph_u64 msg[16], sph_u64 val[8])
+ }
+ 
+ #endif
++
++#endif /* HAVE_GNUTLS */
+diff --git a/libqpdf/sph/sph_sha2.h b/libqpdf/sph/sph_sha2.h
+index 4bff9cd..584c6ab 100644
+--- a/libqpdf/sph/sph_sha2.h
++++ b/libqpdf/sph/sph_sha2.h
+@@ -47,6 +47,12 @@ extern "C" {
+ #include <stddef.h>
+ #include "sph_types.h"
+ 
++#include <qpdf/qpdf-config.h>
++
++#ifdef HAVE_GNUTLS
++# include "sph_sha2_gnutls.h"
++#else
++
+ /**
+  * Output size (in bits) for SHA-224.
+  */
+@@ -371,6 +377,8 @@ void sph_sha512_comp(const sph_u64 msg[16], sph_u64 val[8]);
+ 
+ #endif
+ 
++#endif /* HAVE_GNUTLS */
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libqpdf/sph/sph_sha2_gnutls.h b/libqpdf/sph/sph_sha2_gnutls.h
+new file mode 100644
+index 0000000..1fb26a4
+--- /dev/null
++++ b/libqpdf/sph/sph_sha2_gnutls.h
+@@ -0,0 +1,88 @@
++#include <qpdf/qpdf-config.h>
++#include <gnutls/crypto.h>
++
++typedef gnutls_hash_hd_t sph_sha256_context;
++typedef gnutls_hash_hd_t sph_sha384_context;
++typedef gnutls_hash_hd_t sph_sha512_context;
++
++/**
++ * Initialize a SHA-256 context.
++ *
++ * @param cc   the SHA-256 context (pointer to
++ *             a <code>sph_sha256_context</code>)
++ */
++void sph_sha256_init(void *cc);
++
++/**
++ * Process some data bytes, for SHA-256.
++ *
++ * @param cc     the SHA-224 context
++ * @param data   the input data
++ * @param len    the input data length (in bytes)
++ */
++void sph_sha256(void *cc, const void *data, size_t len);
++
++/**
++ * Terminate the current SHA-256 computation and output the result into the
++ * provided buffer. The destination buffer must be wide enough to
++ * accomodate the result (32 bytes).
++ *
++ * @param cc    the SHA-256 context
++ * @param dst   the destination buffer
++ */
++void sph_sha256_close(void *cc, void *dst);
++
++/**
++ * Initialize a SHA-384 context.
++ *
++ * @param cc   the SHA-384 context (pointer to
++ *             a <code>sph_sha384_context</code>)
++ */
++void sph_sha384_init(void *cc);
++
++/**
++ * Process some data bytes. It is acceptable that <code>len</code> is zero
++ * (in which case this function does nothing).
++ *
++ * @param cc     the SHA-384 context
++ * @param data   the input data
++ * @param len    the input data length (in bytes)
++ */
++void sph_sha384(void *cc, const void *data, size_t len);
++
++/**
++ * Terminate the current SHA-384 computation and output the result into the
++ * provided buffer. The destination buffer must be wide enough to
++ * accomodate the result (48 bytes).
++ *
++ * @param cc    the SHA-384 context
++ * @param dst   the destination buffer
++ */
++void sph_sha384_close(void *cc, void *dst);
++
++/**
++ * Initialize a SHA-512 context.
++ *
++ * @param cc   the SHA-512 context (pointer to
++ *             a <code>sph_sha512_context</code>)
++ */
++void sph_sha512_init(void *cc);
++
++/**
++ * Process some data bytes, for SHA-512.
++ *
++ * @param cc     the SHA-384 context
++ * @param data   the input data
++ * @param len    the input data length (in bytes)
++ */
++void sph_sha512(void *cc, const void *data, size_t len);
++
++/**
++ * Terminate the current SHA-512 computation and output the result into the
++ * provided buffer. The destination buffer must be wide enough to
++ * accomodate the result (64 bytes).
++ *
++ * @param cc    the SHA-512 context
++ * @param dst   the destination buffer
++ */
++void sph_sha512_close(void *cc, void *dst);
+diff --git a/libqpdf/sph/sph_types.h b/libqpdf/sph/sph_types.h
+index eab09a2..36d1ff6 100644
+--- a/libqpdf/sph/sph_types.h
++++ b/libqpdf/sph/sph_types.h
+@@ -48,6 +48,7 @@
+ #define SPH_TYPES_H__
+ 
+ #include <limits.h>
++#include <qpdf/qpdf-config.h>
+ 
+ /*
+  * All our I/O functions are defined over octet streams. We do not know
